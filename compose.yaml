@@ -1,0 +1,9 @@
+# Local Redis for Django Channels (channel layer).
+# Run: docker compose up -d
+# Then: python manage.py runserver
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
