@@ -4,6 +4,7 @@ from asgiref.sync import sync_to_async
 from channels.generic.websocket import AsyncWebsocketConsumer
 from django.contrib.auth import get_user_model
 from django.db.models import Q
+from django.utils import timezone
 
 from friends.models import Friendship
 from .models import Message
@@ -11,8 +12,23 @@ from .models import Message
 User = get_user_model()
 
 
+def _set_user_online_status(user_id, online):
+    user = User.objects.get(pk=user_id)
+    user.is_online = online
+    if not online:
+        user.last_seen = timezone.now()
+    if online:
+        user.save(update_fields=["is_online"])
+    else:
+        user.save(update_fields=["is_online", "last_seen"])
+
+
+set_user_online_status = sync_to_async(_set_user_online_status)
+
+
 class ChatConsumer(AsyncWebsocketConsumer):
     room_group_name = None
+    _accepted = False
 
     async def connect(self):
         self.user = self.scope["user"]
@@ -43,8 +59,31 @@ class ChatConsumer(AsyncWebsocketConsumer):
 
         await self.channel_layer.group_add(self.room_group_name, self.channel_name)
         await self.accept()
+        self._accepted = True
+
+        await set_user_online_status(self.user.id, True)
+        await self.channel_layer.group_send(
+            self.room_group_name,
+            {
+                "type": "presence_event",
+                "sender": self.user.email,
+                "online": True,
+            },
+        )
 
     async def disconnect(self, close_code):
+        if self._accepted:
+            await set_user_online_status(self.user.id, False)
+            if self.room_group_name:
+                await self.channel_layer.group_send(
+                    self.room_group_name,
+                    {
+                        "type": "presence_event",
+                        "sender": self.user.email,
+                        "online": False,
+                    },
+                )
+
         if self.room_group_name:
             await self.channel_layer.group_discard(self.room_group_name, self.channel_name)
 
@@ -55,6 +94,23 @@ class ChatConsumer(AsyncWebsocketConsumer):
             data = json.loads(text_data)
         except json.JSONDecodeError:
             await self.send(text_data=json.dumps({"error": "Invalid JSON"}))
+            return
+
+        typing = data.get("typing", False)
+        if typing:
+            await self.channel_layer.group_send(
+                self.room_group_name,
+                {"type": "typing_event", "sender": self.user.email},
+            )
+            return
+
+        seen = data.get("seen", False)
+        if seen:
+            await self.mark_messages_seen()
+            await self.channel_layer.group_send(
+                self.room_group_name,
+                {"type": "seen_event", "sender": self.user.email},
+            )
             return
 
         message = data.get("message")
@@ -79,9 +135,41 @@ class ChatConsumer(AsyncWebsocketConsumer):
         await self.send(
             text_data=json.dumps(
                 {
+                    "type": "message",
                     "message": event["message"],
                     "sender": event["sender"],
                     "message_id": event["message_id"],
+                }
+            )
+        )
+
+    async def typing_event(self, event):
+        await self.send(
+            text_data=json.dumps(
+                {
+                    "type": "typing",
+                    "sender": event["sender"],
+                }
+            )
+        )
+
+    async def seen_event(self, event):
+        await self.send(
+            text_data=json.dumps(
+                {
+                    "type": "seen",
+                    "sender": event["sender"],
+                }
+            )
+        )
+
+    async def presence_event(self, event):
+        await self.send(
+            text_data=json.dumps(
+                {
+                    "type": "presence",
+                    "sender": event["sender"],
+                    "online": event["online"],
                 }
             )
         )
@@ -92,6 +180,14 @@ class ChatConsumer(AsyncWebsocketConsumer):
             Q(user1_id=user_a_id, user2_id=user_b_id)
             | Q(user1_id=user_b_id, user2_id=user_a_id)
         ).exists()
+
+    @sync_to_async
+    def mark_messages_seen(self):
+        Message.objects.filter(
+            sender_id=self.other_user_id,
+            receiver=self.user,
+            is_seen=False,
+        ).update(is_seen=True)
 
     @sync_to_async
     def save_message(self, text):
