@@ -7,6 +7,7 @@ from django.db.models import Q
 from django.utils import timezone
 
 from friends.models import Friendship
+from notifications.utils import create_notification
 from .models import Message
 
 User = get_user_model()
@@ -28,6 +29,7 @@ set_user_online_status = sync_to_async(_set_user_online_status)
 
 class ChatConsumer(AsyncWebsocketConsumer):
     room_group_name = None
+    user_group = None
     _accepted = False
 
     async def connect(self):
@@ -56,8 +58,10 @@ class ChatConsumer(AsyncWebsocketConsumer):
         self.room_group_name = (
             f"chat_{min(self.user.id, self.other_user_id)}_{max(self.user.id, self.other_user_id)}"
         )
+        self.user_group = f"user_{self.user.id}"
 
         await self.channel_layer.group_add(self.room_group_name, self.channel_name)
+        await self.channel_layer.group_add(self.user_group, self.channel_name)
         await self.accept()
         self._accepted = True
 
@@ -84,6 +88,8 @@ class ChatConsumer(AsyncWebsocketConsumer):
                     },
                 )
 
+        if self.user_group:
+            await self.channel_layer.group_discard(self.user_group, self.channel_name)
         if self.room_group_name:
             await self.channel_layer.group_discard(self.room_group_name, self.channel_name)
 
@@ -106,11 +112,22 @@ class ChatConsumer(AsyncWebsocketConsumer):
 
         seen = data.get("seen", False)
         if seen:
-            await self.mark_messages_seen()
+            count = await self.mark_messages_seen()
             await self.channel_layer.group_send(
                 self.room_group_name,
                 {"type": "seen_event", "sender": self.user.email},
             )
+            if count > 0:
+                seen_msg = f"{self.user.email} saw your messages"
+                await self.create_message_seen_notification(seen_msg)
+                await self.channel_layer.group_send(
+                    f"user_{self.other_user_id}",
+                    {
+                        "type": "notify",
+                        "notification_type": "message_seen",
+                        "message": seen_msg,
+                    },
+                )
             return
 
         message = data.get("message")
@@ -118,7 +135,9 @@ class ChatConsumer(AsyncWebsocketConsumer):
             await self.send(text_data=json.dumps({"error": "message is required"}))
             return
 
-        saved_message = await self.save_message(str(message).strip())
+        text = str(message).strip()
+        saved_message = await self.save_message(text)
+        await self.create_new_message_notification(text)
 
         await self.channel_layer.group_send(
             self.room_group_name,
@@ -128,6 +147,16 @@ class ChatConsumer(AsyncWebsocketConsumer):
                 "sender": self.user.email,
                 "receiver_id": self.other_user_id,
                 "message_id": saved_message.id,
+            },
+        )
+
+        notif_message = f"{self.user.email}: {saved_message.message}"
+        await self.channel_layer.group_send(
+            f"user_{self.other_user_id}",
+            {
+                "type": "notify",
+                "notification_type": "new_message",
+                "message": notif_message,
             },
         )
 
@@ -174,6 +203,17 @@ class ChatConsumer(AsyncWebsocketConsumer):
             )
         )
 
+    async def notify(self, event):
+        await self.send(
+            text_data=json.dumps(
+                {
+                    "type": "notification",
+                    "notification_type": event.get("notification_type", ""),
+                    "message": event["message"],
+                }
+            )
+        )
+
     @sync_to_async
     def _users_are_friends(self, user_a_id, user_b_id):
         return Friendship.objects.filter(
@@ -183,11 +223,29 @@ class ChatConsumer(AsyncWebsocketConsumer):
 
     @sync_to_async
     def mark_messages_seen(self):
-        Message.objects.filter(
+        return Message.objects.filter(
             sender_id=self.other_user_id,
             receiver=self.user,
             is_seen=False,
         ).update(is_seen=True)
+
+    @sync_to_async
+    def create_new_message_notification(self, message_text):
+        receiver = User.objects.get(id=self.other_user_id)
+        create_notification(
+            user=receiver,
+            notification_type="new_message",
+            message=f"{self.user.email}: {message_text}",
+        )
+
+    @sync_to_async
+    def create_message_seen_notification(self, message_text):
+        other = User.objects.get(id=self.other_user_id)
+        create_notification(
+            user=other,
+            notification_type="message_seen",
+            message=message_text,
+        )
 
     @sync_to_async
     def save_message(self, text):

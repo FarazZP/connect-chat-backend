@@ -6,6 +6,8 @@ from .models import FriendRequest, Friendship
 from .serializers import FriendRequestSerializer
 from django.shortcuts import get_object_or_404
 
+from notifications.utils import create_notification, push_notification_ws
+
 User = get_user_model()
 
 
@@ -31,6 +33,10 @@ class SendFriendRequestView(APIView):
             receiver=receiver
         )
 
+        msg = f"{request.user.email} sent you a friend request"
+        create_notification(receiver, "friend_request", msg)
+        push_notification_ws(receiver.id, "friend_request", msg)
+
         return Response({"message": "Friend request sent"})
 
 
@@ -47,6 +53,10 @@ class AcceptFriendRequestView(APIView):
             user1=friend_request.sender,
             user2=friend_request.receiver
         )
+
+        msg = f"{request.user.email} accepted your friend request"
+        create_notification(friend_request.sender, "friend_accept", msg)
+        push_notification_ws(friend_request.sender.id, "friend_accept", msg)
 
         return Response({"message": "Friend request accepted"})
 
